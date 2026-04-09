@@ -1,0 +1,12 @@
+# Binaries
+dist/
+bin/
+distributed-kv
+
+# Database Data (Don't push your local testing data!)
+data/
+*.log
+*.db
+
+# Go dependencies
+vendor/

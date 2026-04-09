@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package kv;
+
+option go_package = "github.com/AliSyed2006/distributed-kv/api/proto";
+
+service KVService {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message PutResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message GetResponse {
+  bytes value = 1;
+  bool found = 2;
+  string error = 3;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message DeleteResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message StatsRequest {}
+
+message StatsResponse {
+  int64 mem_table_size = 1;
+  int32 sstable_count = 2;
+  int64 max_mem_size = 3;
+}
