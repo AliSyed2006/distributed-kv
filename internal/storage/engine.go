@@ -202,12 +202,12 @@ func (e *StorageEngine) flushToSSTable() error {
 	// 1. Write MemTable to a new SSTable
 	sstName := fmt.Sprintf("%05d.sst", e.nextSSTId)
 	sstPath := filepath.Join(e.dir, sstName)
-	writer, err := NewSSTableWriter(sstPath)
+	entries := e.memTable.Entries()
+	writer, err := NewSSTableWriter(sstPath, len(entries))
 	if err != nil {
 		return err
 	}
 	
-	entries := e.memTable.Entries()
 	if len(entries) > 0 {
 		if err := writer.Write(entries); err != nil {
 			return err
@@ -276,15 +276,25 @@ func (e *StorageEngine) TriggerCompaction() error {
 		return err
 	}
 
-	// Replace the compacted readers with the new one
-	// We assume we compacted ALL current ones for this simple implementation
-	// In a real one we'd only replace the specific ones.
-	oldSSTs := e.sstables
-	e.sstables = []*SSTableReader{newReader}
+	// Selective Swap: Remove only the readers that were just compacted.
+	// New readers added to e.sstables during compaction (e.g. by flushes) are preserved.
+	compactedMap := make(map[*SSTableReader]bool)
+	for _, r := range readersToCompact {
+		compactedMap[r] = true
+	}
+
+	var preservedSSTables []*SSTableReader
+	for _, r := range e.sstables {
+		if !compactedMap[r] {
+			preservedSSTables = append(preservedSSTables, r)
+		}
+	}
+
+	e.sstables = append(preservedSSTables, newReader)
 	e.nextSSTId++
 
 	// Close and delete old files
-	for _, r := range oldSSTs {
+	for _, r := range readersToCompact {
 		path := r.file.Name()
 		r.Close()
 		os.Remove(path)

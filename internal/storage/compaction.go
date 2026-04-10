@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"container/heap"
 )
 
 // Compactor performs K-Way Merge of multiple SSTables into a single one.
@@ -14,6 +15,36 @@ func NewCompactor(destDir string) *Compactor {
 	return &Compactor{destDir: destDir}
 }
 
+type heapEntry struct {
+	entry   Entry
+	iterIdx int
+}
+
+type entryHeap []heapEntry
+
+func (h entryHeap) Len() int           { return len(h) }
+func (h entryHeap) Less(i, j int) bool {
+	cmp := bytes.Compare(h[i].entry.Key, h[j].entry.Key)
+	if cmp == 0 {
+		// If keys are equal, prioritize the one from the newer SSTable (lower index)
+		return h[i].iterIdx < h[j].iterIdx
+	}
+	return cmp < 0
+}
+func (h entryHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *entryHeap) Push(x interface{}) {
+	*h = append(*h, x.(heapEntry))
+}
+
+func (h *entryHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 // Compact merges the provided SSTables into a new one.
 // readers: slice of SSTableReaders, from newest to oldest.
 func (c *Compactor) Compact(readers []*SSTableReader, outPath string) error {
@@ -22,60 +53,65 @@ func (c *Compactor) Compact(readers []*SSTableReader, outPath string) error {
 	}
 
 	iterators := make([]*SSTableIterator, len(readers))
+	h := &entryHeap{}
+	heap.Init(h)
+
 	for i, r := range readers {
 		iterators[i] = r.Iterator()
-		iterators[i].Next() // Initialize
+		if iterators[i].Next() {
+			heap.Push(h, heapEntry{
+				entry:   iterators[i].Entry(),
+				iterIdx: i,
+			})
+		}
 	}
 
-	writer, err := NewSSTableWriter(outPath)
+	// We pass 0 as estimatedEntries for now, SSTableWriter will use a default.
+	writer, err := NewSSTableWriter(outPath, 0)
 	if err != nil {
 		return err
 	}
 
-	var mergedEntries []Entry
+	hasEntries := false
+	for h.Len() > 0 {
+		// 1. Pop the smallest key. Due to h.Less, if keys are equal,
+		// the one from the newest SSTable comes first.
+		min := heap.Pop(h).(heapEntry)
+		minKey := min.entry.Key
+		winnerValue := min.entry.Value
+		
+		// Push next entry from the iterator we just popped.
+		if iterators[min.iterIdx].Next() {
+			heap.Push(h, heapEntry{
+				entry:   iterators[min.iterIdx].Entry(),
+				iterIdx: min.iterIdx,
+			})
+		}
 
-	for {
-		// 1. Find the smallest key across all iterators.
-		var minKey []byte
-		foundAny := false
-		for _, it := range iterators {
-			if it.off < it.limit {
-				if !foundAny || bytes.Compare(it.Entry().Key, minKey) < 0 {
-					minKey = it.Entry().Key
-					foundAny = true
-				}
+		// 2. Handle duplicates: pop all entries from other iterators with the same key.
+		for h.Len() > 0 && bytes.Equal((*h)[0].entry.Key, minKey) {
+			dup := heap.Pop(h).(heapEntry)
+			if iterators[dup.iterIdx].Next() {
+				heap.Push(h, heapEntry{
+					entry:   iterators[dup.iterIdx].Entry(),
+					iterIdx: dup.iterIdx,
+				})
 			}
 		}
 
-		if !foundAny {
-			break // All iterators exhausted
-		}
-
-		// 2. Pick the value from the newest SSTable (lowest index in our slice).
-		var winnerValue []byte
-		winnerFound := false
-		for _, it := range iterators {
-			if it.off <= it.limit && bytes.Equal(it.Entry().Key, minKey) {
-				if !winnerFound {
-					winnerValue = it.Entry().Value
-					winnerFound = true
-				}
-				// Advance all iterators that have this key.
-				it.Next()
-			}
-		}
-
-		// 3. Evict tombstones (nil value) and add to merged set.
+		// 3. Evict tombstones (nil value) and add to writer.
 		if winnerValue != nil {
-			mergedEntries = append(mergedEntries, Entry{Key: minKey, Value: winnerValue})
+			if err := writer.Add(Entry{Key: minKey, Value: winnerValue}); err != nil {
+				return err
+			}
+			hasEntries = true
 		}
 	}
 
-	if len(mergedEntries) > 0 {
-		return writer.Write(mergedEntries)
+	if hasEntries {
+		return writer.Close()
 	}
 
 	// If everything was tombstones, we still need to finalize or handle empty file.
-	// For now, just close if nothing to write.
-	return writer.file.Close()
+	return writer.Close()
 }

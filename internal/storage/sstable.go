@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -20,6 +21,7 @@ const (
 // SSTableWriter creates an immutable SSTable from sorted entries.
 type SSTableWriter struct {
 	file         *os.File
+	buf          *bufio.Writer
 	index        []indexEntry
 	currBlockOff uint64
 	currBlockLen uint32
@@ -32,52 +34,65 @@ type indexEntry struct {
 }
 
 // NewSSTableWriter creates a new SSTableWriter.
-func NewSSTableWriter(path string) (*SSTableWriter, error) {
+// estimatedEntries is used to size the Bloom Filter.
+func NewSSTableWriter(path string, estimatedEntries int) (*SSTableWriter, error) {
 	file, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
+
+	if estimatedEntries <= 0 {
+		estimatedEntries = 1000 // Default fallback
+	}
+
 	return &SSTableWriter{
-		file: file,
+		file:  file,
+		buf:   bufio.NewWriterSize(file, 4*1024*1024),
+		bloom: NewBloomFilter(estimatedEntries*10, 7),
 	}, nil
 }
 
+// Add appends a single entry to the SSTable. Entries must be added in sorted order.
+func (sw *SSTableWriter) Add(entry Entry) error {
+	// Add key to bloom filter.
+	sw.bloom.Add(entry.Key)
+
+	// If it's the start of a new block, record it in the index.
+	if sw.currBlockLen == 0 {
+		sw.index = append(sw.index, indexEntry{
+			key:    entry.Key,
+			offset: sw.currBlockOff,
+		})
+	}
+
+	// Write [KeyLen (4), Key, ValueLen (4), Value]
+	if err := sw.writeEntry(entry); err != nil {
+		return err
+	}
+
+	// Check if we should start a new block.
+	if sw.currBlockLen >= BlockSize {
+		sw.currBlockOff += uint64(sw.currBlockLen)
+		sw.currBlockLen = 0
+	}
+
+	return nil
+}
+
 // Write takes sorted entries and persists them to the SSTable file.
+// Deprecated: Use Add and Close for incremental writes to avoid OOM.
 func (sw *SSTableWriter) Write(entries []Entry) error {
 	if len(entries) == 0 {
 		return fmt.Errorf("no entries to write")
 	}
 
-	// Initialize Bloom Filter: ~10 bits per key, 7 hash functions.
-	sw.bloom = NewBloomFilter(len(entries)*10, 7)
-
-	for i, entry := range entries {
-		// Add key to bloom filter.
-		sw.bloom.Add(entry.Key)
-
-		// If it's the start of a new block, record it in the index.
-		if sw.currBlockLen == 0 {
-			sw.index = append(sw.index, indexEntry{
-				key:    entry.Key,
-				offset: sw.currBlockOff,
-			})
-		}
-
-		// Write [KeyLen (4), Key, ValueLen (4), Value]
-		if err := sw.writeEntry(entry); err != nil {
+	for _, entry := range entries {
+		if err := sw.Add(entry); err != nil {
 			return err
-		}
-
-		// Check if we should start a new block.
-		// We ensure at least one entry per block, and then check size.
-		if sw.currBlockLen >= BlockSize && i < len(entries)-1 {
-			sw.currBlockOff += uint64(sw.currBlockLen)
-			sw.currBlockLen = 0
 		}
 	}
 
-	// Finalize file: write Bloom Filter, Index and Footer.
-	return sw.finalize()
+	return sw.Close()
 }
 
 func (sw *SSTableWriter) writeEntry(e Entry) error {
@@ -85,19 +100,19 @@ func (sw *SSTableWriter) writeEntry(e Entry) error {
 	valLen := uint32(len(e.Value))
 	
 	// Write KeyLen
-	if err := binary.Write(sw.file, binary.LittleEndian, keyLen); err != nil {
+	if err := binary.Write(sw.buf, binary.LittleEndian, keyLen); err != nil {
 		return err
 	}
 	// Write Key
-	if _, err := sw.file.Write(e.Key); err != nil {
+	if _, err := sw.buf.Write(e.Key); err != nil {
 		return err
 	}
 	// Write ValueLen
-	if err := binary.Write(sw.file, binary.LittleEndian, valLen); err != nil {
+	if err := binary.Write(sw.buf, binary.LittleEndian, valLen); err != nil {
 		return err
 	}
 	// Write Value
-	if _, err := sw.file.Write(e.Value); err != nil {
+	if _, err := sw.buf.Write(e.Value); err != nil {
 		return err
 	}
 
@@ -105,7 +120,13 @@ func (sw *SSTableWriter) writeEntry(e Entry) error {
 	return nil
 }
 
-func (sw *SSTableWriter) finalize() error {
+// Close finalizes the SSTable file by writing Bloom Filter, Index and Footer.
+func (sw *SSTableWriter) Close() error {
+	// Flush the buffer before writing footers and closing.
+	if err := sw.buf.Flush(); err != nil {
+		return err
+	}
+
 	// 1. Write Bloom Filter
 	bloomOff, err := sw.file.Seek(0, io.SeekCurrent)
 	if err != nil {
@@ -157,9 +178,10 @@ func (sw *SSTableWriter) finalize() error {
 
 // SSTableReader provides read access to an SSTable file.
 type SSTableReader struct {
-	file  *os.File
-	index []indexEntry
-	bloom *BloomFilter
+	file     *os.File
+	index    []indexEntry
+	bloom    *BloomFilter
+	bloomOff uint64
 }
 
 // NewSSTableReader opens an SSTable file and reads its index and bloom filter.
@@ -178,68 +200,71 @@ func NewSSTableReader(path string) (*SSTableReader, error) {
 	if stat.Size() < FooterSize {
 		return nil, fmt.Errorf("file too small")
 	}
-	if _, err := file.Seek(-FooterSize, io.SeekEnd); err != nil {
+	
+	footerOff := stat.Size() - FooterSize
+	buf := make([]byte, FooterSize)
+	if _, err := file.ReadAt(buf, footerOff); err != nil {
 		return nil, err
 	}
 
-	var bloomOff, indexOff, magic uint64
-	if err := binary.Read(file, binary.LittleEndian, &bloomOff); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(file, binary.LittleEndian, &indexOff); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(file, binary.LittleEndian, &magic); err != nil {
-		return nil, err
-	}
+	bloomOff := binary.LittleEndian.Uint64(buf[0:8])
+	indexOff := binary.LittleEndian.Uint64(buf[8:16])
+	magic := binary.LittleEndian.Uint64(buf[16:24])
+	
 	if magic != MagicNumber {
 		return nil, fmt.Errorf("invalid magic number")
 	}
 
 	// Read Bloom Filter
-	if _, err := file.Seek(int64(bloomOff), io.SeekStart); err != nil {
-		return nil, err
-	}
 	var bloomLen uint32
-	if err := binary.Read(file, binary.LittleEndian, &bloomLen); err != nil {
+	lenBuf := make([]byte, 4)
+	if _, err := file.ReadAt(lenBuf, int64(bloomOff)); err != nil {
 		return nil, err
 	}
+	bloomLen = binary.LittleEndian.Uint32(lenBuf)
+	
 	bloomData := make([]byte, bloomLen)
-	if _, err := io.ReadFull(file, bloomData); err != nil {
+	if _, err := file.ReadAt(bloomData, int64(bloomOff)+4); err != nil {
 		return nil, err
 	}
 	bloom := NewBloomFilterFromData(bloomData)
 
 	// Read Index
-	if _, err := file.Seek(int64(indexOff), io.SeekStart); err != nil {
+	if _, err := file.ReadAt(lenBuf, int64(indexOff)); err != nil {
 		return nil, err
 	}
-	var numEntries uint32
-	if err := binary.Read(file, binary.LittleEndian, &numEntries); err != nil {
-		return nil, err
-	}
+	numEntries := binary.LittleEndian.Uint32(lenBuf)
 
 	index := make([]indexEntry, numEntries)
+	currOff := int64(indexOff) + 4
 	for i := uint32(0); i < numEntries; i++ {
-		var keyLen uint32
-		if err := binary.Read(file, binary.LittleEndian, &keyLen); err != nil {
+		if _, err := file.ReadAt(lenBuf, currOff); err != nil {
 			return nil, err
 		}
+		keyLen := binary.LittleEndian.Uint32(lenBuf)
+		currOff += 4
+
 		key := make([]byte, keyLen)
-		if _, err := io.ReadFull(file, key); err != nil {
+		if _, err := file.ReadAt(key, currOff); err != nil {
 			return nil, err
 		}
-		var offset uint64
-		if err := binary.Read(file, binary.LittleEndian, &offset); err != nil {
+		currOff += int64(keyLen)
+
+		offBuf := make([]byte, 8)
+		if _, err := file.ReadAt(offBuf, currOff); err != nil {
 			return nil, err
 		}
+		offset := binary.LittleEndian.Uint64(offBuf)
+		currOff += 8
+
 		index[i] = indexEntry{key: key, offset: offset}
 	}
 
 	return &SSTableReader{
-		file:  file,
-		index: index,
-		bloom: bloom,
+		file:     file,
+		index:    index,
+		bloom:    bloom,
+		bloomOff: bloomOff,
 	}, nil
 }
 
@@ -268,55 +293,55 @@ func (sr *SSTableReader) Get(key []byte) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 
-	// 3. Read the block
-	offset := sr.index[blockIdx].offset
-	if _, err := sr.file.Seek(int64(offset), io.SeekStart); err != nil {
+	// 3. Read the entire block into memory at once.
+	blockOff := int64(sr.index[blockIdx].offset)
+	var limit int64
+	if blockIdx+1 < len(sr.index) {
+		limit = int64(sr.index[blockIdx+1].offset)
+	} else {
+		limit = int64(sr.bloomOff)
+	}
+
+	blockSize := limit - blockOff
+	blockBuf := make([]byte, blockSize)
+	if _, err := sr.file.ReadAt(blockBuf, blockOff); err != nil {
 		return nil, false, err
 	}
 
-	// Scan the block for the key.
-	var limit uint64
-	if blockIdx+1 < len(sr.index) {
-		limit = sr.index[blockIdx+1].offset
-	} else {
-		// Re-read footer to get bloom offset (where data blocks end)
-		stat, _ := sr.file.Stat()
-		sr.file.Seek(stat.Size()-FooterSize, io.SeekStart)
-		var bloomOff uint64
-		binary.Read(sr.file, binary.LittleEndian, &bloomOff)
-		limit = bloomOff
-		sr.file.Seek(int64(offset), io.SeekStart)
-	}
-
-	for {
-		currOff, _ := sr.file.Seek(0, io.SeekCurrent)
-		if uint64(currOff) >= limit {
+	// Scan the RAM buffer for the key.
+	currOff := 0
+	for currOff < len(blockBuf) {
+		if currOff+4 > len(blockBuf) {
 			break
 		}
+		keyLen := binary.LittleEndian.Uint32(blockBuf[currOff : currOff+4])
+		currOff += 4
 
-		var keyLen uint32
-		if err := binary.Read(sr.file, binary.LittleEndian, &keyLen); err != nil {
-			if err == io.EOF { break }
-			return nil, false, err
+		if currOff+int(keyLen) > len(blockBuf) {
+			break
 		}
-		currKey := make([]byte, keyLen)
-		if _, err := io.ReadFull(sr.file, currKey); err != nil {
-			return nil, false, err
-		}
+		currKey := blockBuf[currOff : currOff+int(keyLen)]
+		currOff += int(keyLen)
 
-		var valLen uint32
-		if err := binary.Read(sr.file, binary.LittleEndian, &valLen); err != nil {
-			return nil, false, err
+		if currOff+4 > len(blockBuf) {
+			break
 		}
-		val := make([]byte, valLen)
-		if _, err := io.ReadFull(sr.file, val); err != nil {
-			return nil, false, err
-		}
+		valLen := binary.LittleEndian.Uint32(blockBuf[currOff : currOff+4])
+		currOff += 4
 
 		cmp := bytes.Compare(currKey, key)
 		if cmp == 0 {
-			return val, true, nil
+			if currOff+int(valLen) > len(blockBuf) {
+				break
+			}
+			val := blockBuf[currOff : currOff+int(valLen)]
+			// Return a copy of the value since blockBuf is local.
+			res := make([]byte, len(val))
+			copy(res, val)
+			return res, true, nil
 		}
+		
+		currOff += int(valLen)
 		if cmp > 0 {
 			break
 		}
@@ -336,17 +361,10 @@ type SSTableIterator struct {
 
 // Iterator returns a new iterator for the SSTable.
 func (sr *SSTableReader) Iterator() *SSTableIterator {
-	stat, _ := sr.file.Stat()
-	// The data blocks end where the bloom filter begins.
-	// We re-read the footer to find the bloom offset.
-	sr.file.Seek(stat.Size()-FooterSize, io.SeekStart)
-	var bloomOff uint64
-	binary.Read(sr.file, binary.LittleEndian, &bloomOff)
-
 	return &SSTableIterator{
 		reader: sr,
 		off:    0,
-		limit:  int64(bloomOff),
+		limit:  int64(sr.bloomOff),
 	}
 }
 
@@ -356,34 +374,39 @@ func (it *SSTableIterator) Next() bool {
 		return false
 	}
 
-	it.reader.file.Seek(it.off, io.SeekStart)
-
-	var keyLen uint32
-	if err := binary.Read(it.reader.file, binary.LittleEndian, &keyLen); err != nil {
+	currOff := it.off
+	lenBuf := make([]byte, 4)
+	if _, err := it.reader.file.ReadAt(lenBuf, currOff); err != nil {
 		if err != io.EOF {
 			it.err = err
 		}
 		return false
 	}
-	key := make([]byte, keyLen)
-	if _, err := io.ReadFull(it.reader.file, key); err != nil {
-		it.err = err
-		return false
-	}
+	keyLen := binary.LittleEndian.Uint32(lenBuf)
+	currOff += 4
 
-	var valLen uint32
-	if err := binary.Read(it.reader.file, binary.LittleEndian, &valLen); err != nil {
+	key := make([]byte, keyLen)
+	if _, err := it.reader.file.ReadAt(key, currOff); err != nil {
 		it.err = err
 		return false
 	}
+	currOff += int64(keyLen)
+
+	if _, err := it.reader.file.ReadAt(lenBuf, currOff); err != nil {
+		it.err = err
+		return false
+	}
+	valLen := binary.LittleEndian.Uint32(lenBuf)
+	currOff += 4
+
 	val := make([]byte, valLen)
-	if _, err := io.ReadFull(it.reader.file, val); err != nil {
+	if _, err := it.reader.file.ReadAt(val, currOff); err != nil {
 		it.err = err
 		return false
 	}
+	currOff += int64(valLen)
 
 	it.curr = Entry{Key: key, Value: val}
-	currOff, _ := it.reader.file.Seek(0, io.SeekCurrent)
 	it.off = currOff
 	return true
 }

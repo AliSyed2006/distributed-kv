@@ -24,7 +24,7 @@ func TestSSTable_WriteRead(t *testing.T) {
 	}
 
 	// 2. Write SSTable
-	writer, err := NewSSTableWriter(tmpFile.Name())
+	writer, err := NewSSTableWriter(tmpFile.Name(), len(entries))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestSSTable_MultipleBlocks(t *testing.T) {
 		entries = append(entries, Entry{Key: key, Value: val})
 	}
 
-	writer, err := NewSSTableWriter(tmpFile.Name())
+	writer, err := NewSSTableWriter(tmpFile.Name(), len(entries))
 	if err != nil {
 		t.Fatal(err)
 	}

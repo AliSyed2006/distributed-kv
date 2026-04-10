@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -16,7 +15,7 @@ import (
 	"github.com/AliSyed2006/distributed-kv/api/proto"
 	"github.com/charmbracelet/lipgloss"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var (
@@ -26,7 +25,7 @@ var (
 			Background(lipgloss.Color("#FF5F87")).
 			Padding(1, 4).
 			MarginBottom(1).
-			Render("KV-CLIENT (CLOUD ENABLED)")
+			Render("KV-CLIENT (TUNNEL MODE)")
 
 	successStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#00FF00")).
@@ -48,23 +47,17 @@ var (
 )
 
 func main() {
-	// If connecting to Codespaces, use: addr-here.app.github.dev:443
+	// Address is localhost because of the 'gh' tunnel
 	addr := flag.String("addr", "localhost:50051", "server address")
 	workers := flag.Int("workers", 10, "number of concurrent workers for stress test")
-	n := flag.Int("n", 10000, "total requests for stress test")
+	n := flag.Int("n", 1000, "total requests for stress test")
 	flag.Parse()
 
 	fmt.Println(headerStyle)
 
-	// TLS Configuration for GitHub Codespaces Proxy
-	// We use InsecureSkipVerify because we are connecting to a generated dev URL
-	creds := credentials.NewTLS(&tls.Config{
-		InsecureSkipVerify: true,
-	})
-
-	// Setup gRPC connection using the 2026 NewClient standard
-	// Use port 443 for cloud URLs!
-	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(creds))
+	// Use Insecure credentials because the GH tunnel is already encrypted.
+	// This fixes the 'handshake failed' / 'connection reset' error.
+	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
 	}
@@ -117,7 +110,7 @@ func main() {
 }
 
 func setKV(client proto.KVServiceClient, key, val string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
 	resp, err := client.Put(ctx, &proto.PutRequest{
@@ -138,7 +131,7 @@ func setKV(client proto.KVServiceClient, key, val string) {
 }
 
 func getKV(client proto.KVServiceClient, key string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
 	resp, err := client.Get(ctx, &proto.GetRequest{
@@ -158,7 +151,7 @@ func getKV(client proto.KVServiceClient, key string) {
 }
 
 func getStats(client proto.KVServiceClient) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
 	resp, err := client.Stats(ctx, &proto.StatsRequest{})
@@ -179,13 +172,12 @@ func getStats(client proto.KVServiceClient) {
 }
 
 func stressTest(client proto.KVServiceClient, numWorkers, totalReqs int) {
-	fmt.Println(infoStyle.Render(fmt.Sprintf("Starting Cloud Stress Test: %d workers, %d total requests...", numWorkers, totalReqs)))
+	fmt.Println(infoStyle.Render(fmt.Sprintf("Starting Tunnel Stress Test: %d workers, %d total requests...", numWorkers, totalReqs)))
 
 	var wg sync.WaitGroup
 	reqPerWorker := totalReqs / numWorkers
 
-	// Pre-generate 1KB value
-	val := make([]byte, 1024)
+	val := make([]byte, 8192)
 	rand.Read(val)
 
 	start := time.Now()
@@ -195,11 +187,10 @@ func stressTest(client proto.KVServiceClient, numWorkers, totalReqs int) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < reqPerWorker; j++ {
-				key := make([]byte, 16)
+				key := make([]byte, 32)
 				rand.Read(key)
 
-				// Increased timeout for cloud latency
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 				_, _ = client.Put(ctx, &proto.PutRequest{
 					Key:   key,
 					Value: val,
