@@ -10,4 +10,4 @@ data/
 api/proto/*.pb.go
 
 # Go dependencies
-vendor/
+vendor/gemini.md
