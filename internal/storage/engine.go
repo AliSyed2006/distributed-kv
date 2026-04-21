@@ -241,7 +241,7 @@ func (e *StorageEngine) flushImmutableToDisk(sstId int, tableToFlush *MemTable) 
 		}
 	}
 
-	// 🚨 RELEASE THE BACKPRESSURE: The disk write is done!
+	// RELEASE THE BACKPRESSURE: The disk write is done!
 	e.mu.Lock()
 	e.immTable = nil
 	e.mu.Unlock()

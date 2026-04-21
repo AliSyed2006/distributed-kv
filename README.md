@@ -1,3 +1,4 @@
+```markdown
 # Distributed Log-Structured Storage Engine
 
 A high-performance, concurrent Key-Value storage engine built in Go. It implements a custom Log-Structured Merge (LSM) tree architecture designed for maximum write throughput, zero-data-loss crash recovery, and low-latency disk reads.
@@ -29,6 +30,36 @@ Tested on local hardware via a concurrent gRPC client utilizing a Two-Phase stre
 * **Read Throughput:** ~74,000 Req/sec
 * **Read Latency:** ~0.01 ms
 * **Data Loss:** 0 (100% Consistency)
+```
+
+## Usage & Benchmarking
+
+You can interact with the engine and run the built-in Two-Phase stress test using the CLI client.
+
+**1. Start the Server**
+Ensure your working directory is clean, then boot the engine:
+```bash
+go run cmd/server/main.go
+```
+
+**2. Start the Client**
+In a separate terminal, launch the interactive gRPC client:
+```bash
+go run cmd/client/main.go
+```
+
+**3. Run the Workload**
+Inside the client prompt, you can run the enterprise stress test by passing the number of concurrent workers and the total request count:
+```text
+kv-client> STRESS 100 200000
+```
+
+You can also interact with the engine manually using standard commands:
+```text
+kv-client> SET mykey myvalue
+kv-client> GET mykey
+kv-client> STATS
+```
 
 ## Project Structure
 

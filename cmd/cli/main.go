@@ -43,6 +43,8 @@ var (
 func main() {
 	fmt.Println(headerStyle)
 
+	fmt.Println("Commands: (GET, SET, DEL, STATS, EXIT)")
+
 	// Initialize StorageEngine
 	opts := storage.EngineOptions{
 		Dir:        "./data",
