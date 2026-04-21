@@ -1,3 +1,11 @@
+/*
+File: sstable.go
+Description: Handles the disk-persistent layer of the LSM tree (Sorted String Tables).
+Implements the SSTableWriter for streaming blocks of sorted entries to disk with
+embedded index offsets and Bloom filters. Implements the SSTableReader for zero-copy
+memory-mapped block reads and binary searching the index.
+*/
+
 package storage
 
 import (
@@ -98,7 +106,7 @@ func (sw *SSTableWriter) Write(entries []Entry) error {
 func (sw *SSTableWriter) writeEntry(e Entry) error {
 	keyLen := uint32(len(e.Key))
 	valLen := uint32(len(e.Value))
-	
+
 	// Write KeyLen
 	if err := binary.Write(sw.buf, binary.LittleEndian, keyLen); err != nil {
 		return err
@@ -200,7 +208,7 @@ func NewSSTableReader(path string) (*SSTableReader, error) {
 	if stat.Size() < FooterSize {
 		return nil, fmt.Errorf("file too small")
 	}
-	
+
 	footerOff := stat.Size() - FooterSize
 	buf := make([]byte, FooterSize)
 	if _, err := file.ReadAt(buf, footerOff); err != nil {
@@ -210,7 +218,7 @@ func NewSSTableReader(path string) (*SSTableReader, error) {
 	bloomOff := binary.LittleEndian.Uint64(buf[0:8])
 	indexOff := binary.LittleEndian.Uint64(buf[8:16])
 	magic := binary.LittleEndian.Uint64(buf[16:24])
-	
+
 	if magic != MagicNumber {
 		return nil, fmt.Errorf("invalid magic number")
 	}
@@ -222,7 +230,7 @@ func NewSSTableReader(path string) (*SSTableReader, error) {
 		return nil, err
 	}
 	bloomLen = binary.LittleEndian.Uint32(lenBuf)
-	
+
 	bloomData := make([]byte, bloomLen)
 	if _, err := file.ReadAt(bloomData, int64(bloomOff)+4); err != nil {
 		return nil, err
@@ -340,7 +348,7 @@ func (sr *SSTableReader) Get(key []byte) ([]byte, bool, error) {
 			copy(res, val)
 			return res, true, nil
 		}
-		
+
 		currOff += int(valLen)
 		if cmp > 0 {
 			break

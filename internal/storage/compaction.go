@@ -1,3 +1,11 @@
+/*
+File: compaction.go
+Description: Implements the background garbage collection and file optimization
+process. Uses a Min-Heap to perform a K-Way merge across multiple overlapping
+SSTables, evicting tombstoned records and consolidating active data into a
+single, fresh SSTable to maintain read performance.
+*/
+
 package storage
 
 import (
@@ -22,7 +30,7 @@ type heapEntry struct {
 
 type entryHeap []heapEntry
 
-func (h entryHeap) Len() int           { return len(h) }
+func (h entryHeap) Len() int { return len(h) }
 func (h entryHeap) Less(i, j int) bool {
 	cmp := bytes.Compare(h[i].entry.Key, h[j].entry.Key)
 	if cmp == 0 {
@@ -79,7 +87,7 @@ func (c *Compactor) Compact(readers []*SSTableReader, outPath string) error {
 		min := heap.Pop(h).(heapEntry)
 		minKey := min.entry.Key
 		winnerValue := min.entry.Value
-		
+
 		// Push next entry from the iterator we just popped.
 		if iterators[min.iterIdx].Next() {
 			heap.Push(h, heapEntry{

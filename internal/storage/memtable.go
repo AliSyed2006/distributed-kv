@@ -1,3 +1,11 @@
+/*
+File: memtable.go
+Description: Implements a concurrent, lock-protected SkipList to serve as the
+in-memory buffer (MemTable) for the LSM tree. It maintains keys in strictly
+sorted order to allow for sequential flushing to disk. Deletions are handled
+by inserting tombstone records (nil values).
+*/
+
 package storage
 
 import (
@@ -18,10 +26,10 @@ type node struct {
 // MemTable is an in-memory storage layer using a SkipList.
 // It is thread-safe and supports Put, Get, and Delete operations.
 type MemTable struct {
-	mu     sync.RWMutex
-	head   *node
-	level  int
-	size   int // Total bytes in MemTable (keys + values)
+	mu    sync.RWMutex
+	head  *node
+	level int
+	size  int // Total bytes in MemTable (keys + values)
 }
 
 // NewMemTable creates a new MemTable.

@@ -1,3 +1,11 @@
+/*
+File: wal.go
+Description: Implements the Write-Ahead Log to guarantee durability (Crash Recovery).
+Uses a high-performance Group Commit mechanism (batching) to coalesce multiple
+concurrent write tasks into single sequential disk syncs, drastically reducing
+I/O bottlenecks under heavy concurrent load.
+*/
+
 package storage
 
 import (

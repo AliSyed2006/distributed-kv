@@ -1,3 +1,13 @@
+/*
+Package storage provides the core Log-Structured Merge (LSM) tree database engine.
+
+File: engine.go
+Description: The central orchestrator for the storage engine. It manages the concurrency
+model, routing incoming writes through the Write-Ahead Log (WAL) and into the active
+MemTable. It handles the lifecycle of immutable MemTables, applies backpressure during
+heavy I/O disk flushes, and safely coordinates background SSTable compactions.
+*/
+
 package storage
 
 import (
@@ -110,7 +120,7 @@ func (e *StorageEngine) Put(key, value []byte) error {
 
 	e.mu.Lock()
 
-	// 🚨 BACKPRESSURE: If the disk is busy and RAM is full, throttle the writers!
+	// If the disk is busy and RAM is full, throttle the writers!
 	for e.immTable != nil && e.memTable.Size() >= e.maxMemSize {
 		e.mu.Unlock()
 		time.Sleep(5 * time.Millisecond) // Wait for the disk to catch up

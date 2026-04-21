@@ -1,3 +1,10 @@
+/*
+File: bloom.go
+Description: A custom implementation of a probabilistic Bloom Filter using FNV
+hashing. Appended to the footer of every SSTable to allow the engine to bypass
+expensive disk reads for keys that definitely do not exist in a given file.
+*/
+
 package storage
 
 import (
