@@ -9,6 +9,6 @@ data/
 *.db
 api/proto/*.pb.go
 
-# Go dependencies
+# Gemini CLI files
 vendor/GEMINI.md
 GEMINI.md

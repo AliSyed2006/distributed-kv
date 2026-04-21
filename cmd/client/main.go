@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AliSyed2006/distributed-kv/api/proto"
@@ -25,7 +27,7 @@ var (
 			Background(lipgloss.Color("#FF5F87")).
 			Padding(1, 4).
 			MarginBottom(1).
-			Render("KV-CLIENT (TUNNEL MODE)")
+			Render("KV-CLIENT (HONEST BENCHMARK MODE)")
 
 	successStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#00FF00")).
@@ -47,16 +49,13 @@ var (
 )
 
 func main() {
-	// Address is localhost because of the 'gh' tunnel
 	addr := flag.String("addr", "localhost:50051", "server address")
-	workers := flag.Int("workers", 10, "number of concurrent workers for stress test")
-	n := flag.Int("n", 1000, "total requests for stress test")
+	workersFlag := flag.Int("workers", 10, "number of concurrent workers for stress test")
+	nFlag := flag.Int("n", 10000, "total requests for stress test")
 	flag.Parse()
 
 	fmt.Println(headerStyle)
 
-	// Use Insecure credentials because the GH tunnel is already encrypted.
-	// This fixes the 'handshake failed' / 'connection reset' error.
 	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("did not connect: %v", err)
@@ -98,7 +97,17 @@ func main() {
 			getStats(client)
 
 		case "STRESS":
-			stressTest(client, *workers, *n)
+			w := *workersFlag
+			n := *nFlag
+			if len(parts) >= 3 {
+				if parsedW, err := strconv.Atoi(parts[1]); err == nil {
+					w = parsedW
+				}
+				if parsedN, err := strconv.Atoi(parts[2]); err == nil {
+					n = parsedN
+				}
+			}
+			stressTest(client, w, n)
 
 		case "EXIT", "QUIT":
 			return
@@ -172,47 +181,117 @@ func getStats(client proto.KVServiceClient) {
 }
 
 func stressTest(client proto.KVServiceClient, numWorkers, totalReqs int) {
-	fmt.Println(infoStyle.Render(fmt.Sprintf("Starting Tunnel Stress Test: %d workers, %d total requests...", numWorkers, totalReqs)))
+	fmt.Println(infoStyle.Render(fmt.Sprintf("Generating %d unique keys for Two-Phase Benchmark...", totalReqs)))
 
-	var wg sync.WaitGroup
-	reqPerWorker := totalReqs / numWorkers
+	// Pre-generate keys so we can READ exactly what we WROTE
+	keys := make([][]byte, totalReqs)
+	for i := 0; i < totalReqs; i++ {
+		k := make([]byte, 32)
+		rand.Read(k)
+		keys[i] = k
+	}
 
-	val := make([]byte, 8192)
+	val := make([]byte, 8192) // 8KB payload
 	rand.Read(val)
 
-	start := time.Now()
+	reqPerWorker := totalReqs / numWorkers
+	var writeErrors, readErrors uint32
+	var notFound uint32
+
+	// ==========================================
+	// PHASE 1: WRITE (PUT)
+	// ==========================================
+	fmt.Println(infoStyle.Render(fmt.Sprintf("▶ Phase 1: WRTING %d payloads (8KB) using %d workers...", totalReqs, numWorkers)))
+	var wg sync.WaitGroup
+	startWrite := time.Now()
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerIdx int) {
 			defer wg.Done()
-			for j := 0; j < reqPerWorker; j++ {
-				key := make([]byte, 32)
-				rand.Read(key)
+			startIdx := workerIdx * reqPerWorker
+			endIdx := startIdx + reqPerWorker
 
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-				_, _ = client.Put(ctx, &proto.PutRequest{
-					Key:   key,
+			for j := startIdx; j < endIdx; j++ {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+				resp, err := client.Put(ctx, &proto.PutRequest{
+					Key:   keys[j],
 					Value: val,
 				})
+				// Catch network errors OR server-side rejections
+				if err != nil || (resp != nil && !resp.Success) {
+					atomic.AddUint32(&writeErrors, 1)
+				}
 				cancel()
 			}
-		}()
+		}(i)
 	}
-
 	wg.Wait()
-	duration := time.Since(start)
+	writeDuration := time.Since(startWrite)
+	writeThroughput := float64(totalReqs) / writeDuration.Seconds()
+	writeAvgLatency := writeDuration.Seconds() * 1000 / float64(totalReqs)
 
-	throughput := float64(totalReqs) / duration.Seconds()
-	avgLatency := duration.Seconds() * 1000 / float64(totalReqs)
+	// ==========================================
+	// PHASE 2: READ (GET)
+	// ==========================================
+	fmt.Println(infoStyle.Render(fmt.Sprintf("▶ Phase 2: READING %d payloads using %d workers...", totalReqs, numWorkers)))
+	startRead := time.Now()
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerIdx int) {
+			defer wg.Done()
+			startIdx := workerIdx * reqPerWorker
+			endIdx := startIdx + reqPerWorker
+
+			for j := startIdx; j < endIdx; j++ {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+				resp, err := client.Get(ctx, &proto.GetRequest{
+					Key: keys[j],
+				})
+				if err != nil {
+					atomic.AddUint32(&readErrors, 1)
+				} else if !resp.Found {
+					atomic.AddUint32(&notFound, 1)
+				}
+				cancel()
+			}
+		}(i)
+	}
+	wg.Wait()
+	readDuration := time.Since(startRead)
+	readThroughput := float64(totalReqs) / readDuration.Seconds()
+	readAvgLatency := readDuration.Seconds() * 1000 / float64(totalReqs)
+
+	// ==========================================
+	// RENDER RESULTS
+	// ==========================================
+
+	errColor := "#00FF00"
+	if writeErrors > 0 || readErrors > 0 || notFound > 0 {
+		errColor = "#FF0000"
+	}
 
 	resultBox := lipgloss.NewStyle().
 		Border(lipgloss.DoubleBorder()).
-		BorderForeground(lipgloss.Color("#00FF00")).
+		BorderForeground(lipgloss.Color(errColor)).
 		Padding(1).
 		Render(fmt.Sprintf(
-			"TEST COMPLETE\n\nTotal Time: %v\nThroughput: %.2f Req/sec\nAvg Latency: %.4f ms",
-			duration, throughput, avgLatency,
+			"BENCHMARK COMPLETE\n"+
+				"────────────────────────────────────\n"+
+				"WRITE (PUT) STATS:\n"+
+				"  Time:       %v\n"+
+				"  Throughput: %.2f Req/sec\n"+
+				"  Latency:    %.4f ms\n"+
+				"  Errors:     %d\n\n"+
+				"READ (GET) STATS:\n"+
+				"  Time:       %v\n"+
+				"  Throughput: %.2f Req/sec\n"+
+				"  Latency:    %.4f ms\n"+
+				"  Not Found:  %d\n"+
+				"  Errors:     %d",
+			writeDuration, writeThroughput, writeAvgLatency, writeErrors,
+			readDuration, readThroughput, readAvgLatency, notFound, readErrors,
 		))
 	fmt.Println(resultBox)
 }

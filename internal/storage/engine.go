@@ -11,10 +11,10 @@ import (
 )
 
 // StorageEngine coordinates the WAL and MemTable to provide a unified API.
-// It ensures every write is persisted to the WAL before being applied to the MemTable.
 type StorageEngine struct {
 	mu         sync.RWMutex
 	memTable   *MemTable
+	immTable   *MemTable // The Frozen table currently writing to disk
 	wal        *WAL
 	dir        string
 	maxMemSize int
@@ -23,13 +23,11 @@ type StorageEngine struct {
 	stopChan   chan struct{}
 }
 
-// EngineOptions contains configuration for the StorageEngine.
 type EngineOptions struct {
 	Dir        string
 	MaxMemSize int
 }
 
-// NewStorageEngine creates a new StorageEngine with the given options.
 func NewStorageEngine(opts EngineOptions) (*StorageEngine, error) {
 	if err := os.MkdirAll(opts.Dir, 0755); err != nil {
 		return nil, err
@@ -43,7 +41,6 @@ func NewStorageEngine(opts EngineOptions) (*StorageEngine, error) {
 
 	memTable := NewMemTable()
 
-	// Recover MemTable from WAL
 	err = wal.Recovery(func(op OpType, key, value []byte) error {
 		if op == OpPut {
 			memTable.Put(key, value)
@@ -56,7 +53,6 @@ func NewStorageEngine(opts EngineOptions) (*StorageEngine, error) {
 		return nil, fmt.Errorf("failed to recover from WAL: %w", err)
 	}
 
-	// Scan for existing SSTables
 	files, err := os.ReadDir(opts.Dir)
 	if err != nil {
 		return nil, err
@@ -69,12 +65,10 @@ func NewStorageEngine(opts EngineOptions) (*StorageEngine, error) {
 		}
 	}
 
-	// Sort SSTables alphabetically (00001.sst, 00002.sst...)
 	sort.Strings(sstFiles)
 
 	var readers []*SSTableReader
 	maxId := 0
-	// Open in reverse order (newest first)
 	for i := len(sstFiles) - 1; i >= 0; i-- {
 		path := filepath.Join(opts.Dir, sstFiles[i])
 		reader, err := NewSSTableReader(path)
@@ -83,7 +77,6 @@ func NewStorageEngine(opts EngineOptions) (*StorageEngine, error) {
 		}
 		readers = append(readers, reader)
 
-		// Parse ID from name (assuming format 0000X.sst)
 		var id int
 		fmt.Sscanf(sstFiles[i], "%d.sst", &id)
 		if id > maxId {
@@ -101,66 +94,68 @@ func NewStorageEngine(opts EngineOptions) (*StorageEngine, error) {
 		stopChan:   make(chan struct{}),
 	}
 
-	// Start background compaction worker
 	go engine.runBackgroundCompaction()
 
 	return engine, nil
 }
 
-// Put writes a key-value pair to the engine.
 func (e *StorageEngine) Put(key, value []byte) error {
-	// 1. Get current WAL pointer safely using a read lock
 	e.mu.RLock()
 	wal := e.wal
 	e.mu.RUnlock()
 
-	// 2. Write to WAL before acquiring the write lock.
-	// This allows multiple goroutines to queue their writes concurrently,
-	// unlocking the throughput of the Group Commit logic.
 	if err := wal.Append(OpPut, key, value); err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
-	// 3. Apply to MemTable
-	e.memTable.Put(key, value)
-
-	// 4. Check if MemTable exceeds max size
-	if e.memTable.Size() >= e.maxMemSize {
-		if err := e.flushToSSTable(); err != nil {
-			return fmt.Errorf("flush failed: %w", err)
-		}
+	// 🚨 BACKPRESSURE: If the disk is busy and RAM is full, throttle the writers!
+	for e.immTable != nil && e.memTable.Size() >= e.maxMemSize {
+		e.mu.Unlock()
+		time.Sleep(5 * time.Millisecond) // Wait for the disk to catch up
+		e.mu.Lock()
 	}
 
+	e.memTable.Put(key, value)
+
+	// If we just hit the limit, WE become the one to trigger the background flush
+	if e.memTable.Size() >= e.maxMemSize && e.immTable == nil {
+		e.triggerBackgroundFlush()
+	}
+
+	e.mu.Unlock()
 	return nil
 }
 
-// Get retrieves the value for a given key.
-// It checks the MemTable first, then searches through SSTables from newest to oldest.
 func (e *StorageEngine) Get(key []byte) ([]byte, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
-	// 1. Check MemTable
 	if val, ok := e.memTable.Get(key); ok {
 		if val == nil {
-			return nil, false // Tombstone found in MemTable
+			return nil, false
 		}
 		return val, true
 	}
 
-	// 2. Check SSTables (newest first)
+	if e.immTable != nil {
+		if val, ok := e.immTable.Get(key); ok {
+			if val == nil {
+				return nil, false
+			}
+			return val, true
+		}
+	}
+
 	for _, sst := range e.sstables {
 		val, ok, err := sst.Get(key)
 		if err != nil {
-			// In a real system we might log this, for now we just skip.
 			continue
 		}
 		if ok {
 			if val == nil {
-				return nil, false // Tombstone found in SSTable
+				return nil, false
 			}
 			return val, true
 		}
@@ -169,140 +164,130 @@ func (e *StorageEngine) Get(key []byte) ([]byte, bool) {
 	return nil, false
 }
 
-// Delete removes a key from the engine.
 func (e *StorageEngine) Delete(key []byte) error {
-	// 1. Get current WAL pointer safely using a read lock
 	e.mu.RLock()
 	wal := e.wal
 	e.mu.RUnlock()
 
-	// 2. Write to WAL first
 	if err := wal.Append(OpDelete, key, nil); err != nil {
 		return fmt.Errorf("wal delete failed: %w", err)
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
-	// 3. Apply to MemTable
+	for e.immTable != nil && e.memTable.Size() >= e.maxMemSize {
+		e.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+		e.mu.Lock()
+	}
+
 	e.memTable.Delete(key)
 
-	// 4. Check size
-	if e.memTable.Size() >= e.maxMemSize {
-		if err := e.flushToSSTable(); err != nil {
-			return fmt.Errorf("flush failed: %w", err)
-		}
+	if e.memTable.Size() >= e.maxMemSize && e.immTable == nil {
+		e.triggerBackgroundFlush()
 	}
 
+	e.mu.Unlock()
 	return nil
 }
 
-// flushToSSTable 'freezes' the current MemTable and starts a new one.
-func (e *StorageEngine) flushToSSTable() error {
-	// 1. Write MemTable to a new SSTable
-	sstName := fmt.Sprintf("%05d.sst", e.nextSSTId)
-	sstPath := filepath.Join(e.dir, sstName)
-	entries := e.memTable.Entries()
-	writer, err := NewSSTableWriter(sstPath, len(entries))
-	if err != nil {
-		return err
-	}
-	
-	if len(entries) > 0 {
-		if err := writer.Write(entries); err != nil {
-			return err
-		}
-
-		// 2. Open the new SSTable for reading and add to the list (newest first)
-		reader, err := NewSSTableReader(sstPath)
-		if err != nil {
-			return err
-		}
-		e.sstables = append([]*SSTableReader{reader}, e.sstables...)
-		e.nextSSTId++
-	}
-
-	// 3. Close current WAL
-	if err := e.wal.Close(); err != nil {
-		return err
-	}
-
-	// 4. Rotate WAL (for now, we'll just move it to a .old file and create a fresh one)
-	walPath := filepath.Join(e.dir, "wal.log")
-	// Note: In a real LSM, we'd delete the WAL after flush, but let's follow the .old prompt
-	oldPath := filepath.Join(e.dir, "wal.log.old")
-	_ = os.Remove(oldPath) // Ignore error if not exists
-	if err := os.Rename(walPath, oldPath); err != nil {
-		return err
-	}
-
-	e.wal, err = NewWAL(walPath)
-	if err != nil {
-		return err
-	}
-
-	// 5. Clear the active MemTable
+// triggerBackgroundFlush rotates RAM and WAL instantly, then spawns the disk writer.
+// MUST BE CALLED WITH e.mu.Lock() HELD!
+func (e *StorageEngine) triggerBackgroundFlush() {
+	e.immTable = e.memTable
 	e.memTable = NewMemTable()
 
-	return nil
+	// Rotate WAL safely
+	if err := e.wal.Close(); err == nil {
+		walPath := filepath.Join(e.dir, "wal.log")
+		oldPath := filepath.Join(e.dir, "wal.log.old")
+		os.Remove(oldPath)
+		os.Rename(walPath, oldPath)
+		e.wal, _ = NewWAL(walPath)
+	}
+
+	sstId := e.nextSSTId
+	e.nextSSTId++
+
+	// Launch heavy I/O in the background!
+	go e.flushImmutableToDisk(sstId, e.immTable)
 }
 
-// TriggerCompaction merges all current SSTables into one.
-func (e *StorageEngine) TriggerCompaction() error {
-	e.mu.Lock()
-	// Capture the current readers to compact
-	readersToCompact := make([]*SSTableReader, len(e.sstables))
-	copy(readersToCompact, e.sstables)
-	if len(readersToCompact) <= 1 {
-		e.mu.Unlock()
-		return nil // Nothing to compact
-	}
-	e.mu.Unlock()
+// flushImmutableToDisk does the heavy lifting without blocking the main engine
+func (e *StorageEngine) flushImmutableToDisk(sstId int, tableToFlush *MemTable) {
+	entries := tableToFlush.Entries()
 
-	compactor := NewCompactor(e.dir)
-	sstName := fmt.Sprintf("%05d.sst", e.nextSSTId)
+	sstName := fmt.Sprintf("%05d.sst", sstId)
 	sstPath := filepath.Join(e.dir, sstName)
 
-	if err := compactor.Compact(readersToCompact, sstPath); err != nil {
+	if writer, err := NewSSTableWriter(sstPath, len(entries)); err == nil {
+		if len(entries) > 0 {
+			writer.Write(entries)
+			if reader, err := NewSSTableReader(sstPath); err == nil {
+				e.mu.Lock()
+				e.sstables = append([]*SSTableReader{reader}, e.sstables...)
+				e.mu.Unlock()
+			}
+		}
+	}
+
+	// 🚨 RELEASE THE BACKPRESSURE: The disk write is done!
+	e.mu.Lock()
+	e.immTable = nil
+	e.mu.Unlock()
+}
+
+func (e *StorageEngine) TriggerCompaction() error {
+	e.mu.Lock()
+	rc := make([]*SSTableReader, len(e.sstables))
+	copy(rc, e.sstables)
+	if len(rc) <= 1 {
+		e.mu.Unlock()
+		return nil
+	}
+
+	cid := e.nextSSTId
+	e.nextSSTId++
+	e.mu.Unlock()
+
+	c := NewCompactor(e.dir)
+	n := fmt.Sprintf("%05d.sst", cid)
+	p := filepath.Join(e.dir, n)
+
+	if err := c.Compact(rc, p); err != nil {
 		return err
 	}
 
-	// Atomic Swap
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	newReader, err := NewSSTableReader(sstPath)
+	nr, err := NewSSTableReader(p)
 	if err != nil {
 		return err
 	}
 
-	// Selective Swap: Remove only the readers that were just compacted.
-	// New readers added to e.sstables during compaction (e.g. by flushes) are preserved.
-	compactedMap := make(map[*SSTableReader]bool)
-	for _, r := range readersToCompact {
-		compactedMap[r] = true
+	cm := make(map[*SSTableReader]bool)
+	for _, r := range rc {
+		cm[r] = true
 	}
 
-	var preservedSSTables []*SSTableReader
+	var ps []*SSTableReader
 	for _, r := range e.sstables {
-		if !compactedMap[r] {
-			preservedSSTables = append(preservedSSTables, r)
+		if !cm[r] {
+			ps = append(ps, r)
 		}
 	}
 
-	e.sstables = append(preservedSSTables, newReader)
-	e.nextSSTId++
+	e.sstables = append(ps, nr)
 
-	// Close and delete old files
-	for _, r := range readersToCompact {
-		path := r.file.Name()
+	for _, r := range rc {
+		fp := r.file.Name()
 		r.Close()
-		os.Remove(path)
+		os.Remove(fp)
 	}
 
 	return nil
 }
-
 func (e *StorageEngine) runBackgroundCompaction() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -316,7 +301,6 @@ func (e *StorageEngine) runBackgroundCompaction() {
 
 			if count > 4 {
 				if err := e.TriggerCompaction(); err != nil {
-					// In a real system, we'd log this error.
 					fmt.Printf("Background compaction failed: %v\n", err)
 				}
 			}
@@ -326,10 +310,20 @@ func (e *StorageEngine) runBackgroundCompaction() {
 	}
 }
 
-// Close gracefully shuts down the engine.
 func (e *StorageEngine) Close() error {
 	close(e.stopChan)
-	
+
+	// Wait for any background flush to finish before closing
+	for {
+		e.mu.RLock()
+		isFlushing := e.immTable != nil
+		e.mu.RUnlock()
+		if !isFlushing {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -337,7 +331,6 @@ func (e *StorageEngine) Close() error {
 	if err := e.wal.Close(); err != nil {
 		errs = append(errs, err)
 	}
-
 	for _, sst := range e.sstables {
 		if err := sst.Close(); err != nil {
 			errs = append(errs, err)
@@ -350,18 +343,15 @@ func (e *StorageEngine) Close() error {
 	return nil
 }
 
-// EngineStats contains runtime statistics for the StorageEngine.
 type EngineStats struct {
 	MemTableSize int
 	SSTableCount int
 	MaxMemSize   int
 }
 
-// Stats returns the current statistics of the engine.
 func (e *StorageEngine) Stats() EngineStats {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-
 	return EngineStats{
 		MemTableSize: e.memTable.Size(),
 		SSTableCount: len(e.sstables),
