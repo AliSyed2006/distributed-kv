@@ -1,4 +1,3 @@
-```markdown
 # Distributed Log-Structured Storage Engine
 
 A high-performance, concurrent Key-Value storage engine built in Go. It implements a custom Log-Structured Merge (LSM) tree architecture designed for maximum write throughput, zero-data-loss crash recovery, and low-latency disk reads.
@@ -30,7 +29,7 @@ Tested on local hardware via a concurrent gRPC client utilizing a Two-Phase stre
 * **Read Throughput:** ~74,000 Req/sec
 * **Read Latency:** ~0.01 ms
 * **Data Loss:** 0 (100% Consistency)
-```
+
 
 ## Usage & Benchmarking
 
