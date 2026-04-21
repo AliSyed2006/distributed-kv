@@ -160,7 +160,7 @@ func getKV(client proto.KVServiceClient, key string) {
 }
 
 func getStats(client proto.KVServiceClient) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
 	defer cancel()
 
 	resp, err := client.Stats(ctx, &proto.StatsRequest{})
@@ -197,7 +197,6 @@ func stressTest(client proto.KVServiceClient, numWorkers, totalReqs int) {
 	reqPerWorker := totalReqs / numWorkers
 	var writeErrors, readErrors uint32
 	var notFound uint32
-
 	// ==========================================
 	// PHASE 1: WRITE (PUT)
 	// ==========================================
@@ -213,16 +212,27 @@ func stressTest(client proto.KVServiceClient, numWorkers, totalReqs int) {
 			endIdx := startIdx + reqPerWorker
 
 			for j := startIdx; j < endIdx; j++ {
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+				// 🚨 INFINITE PATIENCE: No timeout!
+				ctx := context.Background()
 				resp, err := client.Put(ctx, &proto.PutRequest{
 					Key:   keys[j],
 					Value: val,
 				})
+
 				// Catch network errors OR server-side rejections
 				if err != nil || (resp != nil && !resp.Success) {
-					atomic.AddUint32(&writeErrors, 1)
+					// TRAP: Print the very first error to the console!
+					if atomic.CompareAndSwapUint32(&writeErrors, 0, 1) {
+						fmt.Printf("\n[WRITE FATAL ERROR] %v\n", err)
+						if resp != nil && !resp.Success {
+							fmt.Printf("[SERVER REJECTION] The server explicitly rejected the write.\n")
+						}
+						// Reset to 1 just to be safe
+						atomic.StoreUint32(&writeErrors, 1)
+					} else {
+						atomic.AddUint32(&writeErrors, 1)
+					}
 				}
-				cancel()
 			}
 		}(i)
 	}

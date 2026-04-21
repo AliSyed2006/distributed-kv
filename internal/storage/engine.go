@@ -20,11 +20,10 @@ import (
 	"time"
 )
 
-// StorageEngine coordinates the WAL and MemTable to provide a unified API.
 type StorageEngine struct {
 	mu         sync.RWMutex
 	memTable   *MemTable
-	immTable   *MemTable // The Frozen table currently writing to disk
+	immTable   *MemTable
 	wal        *WAL
 	dir        string
 	maxMemSize int
@@ -112,24 +111,26 @@ func NewStorageEngine(opts EngineOptions) (*StorageEngine, error) {
 func (e *StorageEngine) Put(key, value []byte) error {
 	e.mu.RLock()
 	wal := e.wal
+	wal.IncWriters()
 	e.mu.RUnlock()
 
-	if err := wal.Append(OpPut, key, value); err != nil {
+	err := wal.Append(OpPut, key, value)
+	wal.DecWriters()
+
+	if err != nil {
 		return fmt.Errorf("wal append failed: %w", err)
 	}
 
 	e.mu.Lock()
 
-	// If the disk is busy and RAM is full, throttle the writers!
 	for e.immTable != nil && e.memTable.Size() >= e.maxMemSize {
 		e.mu.Unlock()
-		time.Sleep(5 * time.Millisecond) // Wait for the disk to catch up
+		time.Sleep(5 * time.Millisecond)
 		e.mu.Lock()
 	}
 
 	e.memTable.Put(key, value)
 
-	// If we just hit the limit, WE become the one to trigger the background flush
 	if e.memTable.Size() >= e.maxMemSize && e.immTable == nil {
 		e.triggerBackgroundFlush()
 	}
@@ -177,9 +178,13 @@ func (e *StorageEngine) Get(key []byte) ([]byte, bool) {
 func (e *StorageEngine) Delete(key []byte) error {
 	e.mu.RLock()
 	wal := e.wal
+	wal.IncWriters()
 	e.mu.RUnlock()
 
-	if err := wal.Append(OpDelete, key, nil); err != nil {
+	err := wal.Append(OpDelete, key, nil)
+	wal.DecWriters()
+
+	if err != nil {
 		return fmt.Errorf("wal delete failed: %w", err)
 	}
 
@@ -201,13 +206,10 @@ func (e *StorageEngine) Delete(key []byte) error {
 	return nil
 }
 
-// triggerBackgroundFlush rotates RAM and WAL instantly, then spawns the disk writer.
-// MUST BE CALLED WITH e.mu.Lock() HELD!
 func (e *StorageEngine) triggerBackgroundFlush() {
 	e.immTable = e.memTable
 	e.memTable = NewMemTable()
 
-	// Rotate WAL safely
 	if err := e.wal.Close(); err == nil {
 		walPath := filepath.Join(e.dir, "wal.log")
 		oldPath := filepath.Join(e.dir, "wal.log.old")
@@ -219,11 +221,9 @@ func (e *StorageEngine) triggerBackgroundFlush() {
 	sstId := e.nextSSTId
 	e.nextSSTId++
 
-	// Launch heavy I/O in the background!
 	go e.flushImmutableToDisk(sstId, e.immTable)
 }
 
-// flushImmutableToDisk does the heavy lifting without blocking the main engine
 func (e *StorageEngine) flushImmutableToDisk(sstId int, tableToFlush *MemTable) {
 	entries := tableToFlush.Entries()
 
@@ -241,7 +241,6 @@ func (e *StorageEngine) flushImmutableToDisk(sstId int, tableToFlush *MemTable) 
 		}
 	}
 
-	// RELEASE THE BACKPRESSURE: The disk write is done!
 	e.mu.Lock()
 	e.immTable = nil
 	e.mu.Unlock()
@@ -298,6 +297,7 @@ func (e *StorageEngine) TriggerCompaction() error {
 
 	return nil
 }
+
 func (e *StorageEngine) runBackgroundCompaction() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -323,7 +323,6 @@ func (e *StorageEngine) runBackgroundCompaction() {
 func (e *StorageEngine) Close() error {
 	close(e.stopChan)
 
-	// Wait for any background flush to finish before closing
 	for {
 		e.mu.RLock()
 		isFlushing := e.immTable != nil

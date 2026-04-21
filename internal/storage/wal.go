@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -22,7 +23,6 @@ const (
 	OpDelete OpType = 1
 )
 
-// writeTask represents a single write request waiting to be committed.
 type writeTask struct {
 	op      OpType
 	key     []byte
@@ -31,9 +31,11 @@ type writeTask struct {
 }
 
 type WAL struct {
-	file     *os.File
-	taskChan chan writeTask
-	stopChan chan struct{}
+	file      *os.File
+	taskChan  chan writeTask
+	stopChan  chan struct{}
+	pending   sync.WaitGroup
+	batcherWg sync.WaitGroup
 }
 
 func NewWAL(path string) (*WAL, error) {
@@ -48,11 +50,22 @@ func NewWAL(path string) (*WAL, error) {
 		stopChan: make(chan struct{}),
 	}
 
+	w.batcherWg.Add(1)
 	go w.runBatcher()
 	return w, nil
 }
 
+func (w *WAL) IncWriters() {
+	w.pending.Add(1)
+}
+
+func (w *WAL) DecWriters() {
+	w.pending.Done()
+}
+
 func (w *WAL) runBatcher() {
+	defer w.batcherWg.Done()
+
 	var batch []writeTask
 	const maxBatch = 200
 	const maxWait = 10 * time.Millisecond
@@ -71,7 +84,6 @@ func (w *WAL) runBatcher() {
 		for _, task := range batch {
 			keyLen := uint32(len(task.key))
 			valLen := uint32(len(task.value))
-			// Header(5) + key + ValHeader(4) + val
 			entry := make([]byte, 5+len(task.key)+4+len(task.value))
 			entry[0] = byte(task.op)
 			binary.LittleEndian.PutUint32(entry[1:5], keyLen)
@@ -152,6 +164,8 @@ func (w *WAL) Recovery(cb func(op OpType, key, value []byte) error) error {
 }
 
 func (w *WAL) Close() error {
+	w.pending.Wait()
 	close(w.stopChan)
+	w.batcherWg.Wait()
 	return w.file.Close()
 }
